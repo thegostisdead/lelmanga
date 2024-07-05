@@ -10,25 +10,32 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
-	"strings"
-	"sync"
 )
 
+type Chapter struct {
+	title string
+	url   string
+}
+
 type MangaInfo struct {
-	firstChapter string
-	lastChapter  string
-	title        string
-	mainURL      string
+	title       string
+	mainURL     string
+	chapterURLs []Chapter
 }
 
 var lastChapterRe = regexp.MustCompile(`(?m)\<span\sclass\=\"epcur\sepcurlast\"\>Chapitre\s(.*?)\<\/span\>`)
 var titleRe = regexp.MustCompile(`(?m)\<h1\sclass\=\"entry\-title\"\sitemprop\=\"name\"\>(.*?)\<\/h1\>`)
 var imagesRe = regexp.MustCompile(`(?m)\<script\>ts_reader\.run\((.*?)\)\;\<\/script\>`)
+var chaptersRe = regexp.MustCompile(`(?ms)data\-num\=\"(.*?)\"\>.*?href\=\"(.*?)\"\>`)
 
 func extractRange(html string, info *MangaInfo) {
-	info.firstChapter = "1"
-	info.lastChapter = lastChapterRe.FindStringSubmatch(html)[1]
+	// group 1: chapter title -> string like 256.5-9
+	// group 2: chapter url
+	chapters := chaptersRe.FindAllStringSubmatch(html, -1)
+	for _, chapter := range chapters {
+		info.chapterURLs = append(info.chapterURLs, Chapter{chapter[1], chapter[2]})
+	}
+
 }
 
 func extractTitle(html string, info *MangaInfo) {
@@ -62,13 +69,17 @@ func getMangaInfo(url string) MangaInfo {
 	extractTitle(string(body), &info)
 
 	fmt.Println("Title: ", info.title)
-	fmt.Println("First Chapter: ", info.firstChapter)
-	fmt.Println("Last Chapter: ", info.lastChapter)
 
 	return info
 }
 
 func makeCbz(chapterDir string) {
+
+	if runtime.GOOS == "windows" {
+		fmt.Println("Zip not supported on windows at the moment")
+		return
+	}
+
 	cmd := exec.Command("zip", "-r", "-j", fmt.Sprintf("%s.cbz", chapterDir), chapterDir)
 	err := cmd.Run()
 	if err != nil {
@@ -76,8 +87,7 @@ func makeCbz(chapterDir string) {
 	}
 }
 
-func downloadChapter(url string, wg *sync.WaitGroup) {
-	defer wg.Done()
+func downloadChapter(url string) {
 
 	fmt.Println("Downloading chapter: ", url)
 	res, err := http.Get(url)
@@ -136,75 +146,44 @@ func downloadChapter(url string, wg *sync.WaitGroup) {
 
 	imageURLs := extractImageURLs(jsonData)
 
-	var imageWg sync.WaitGroup
-	semaphore := make(chan struct{}, 10) // Limit to 5 concurrent image downloads
-
 	for i, imgURL := range imageURLs {
-		imageWg.Add(1)
-		semaphore <- struct{}{}
-		go func(i int, imgURL string) {
-			defer imageWg.Done()
-			defer func() { <-semaphore }()
 
-			imgRes, err := http.Get(imgURL)
-			if err != nil {
-				fmt.Printf("error downloading image %d: %s\n", i, err)
-				return
-			}
-			defer imgRes.Body.Close()
+		imgRes, err := http.Get(imgURL)
+		if err != nil {
+			fmt.Printf("error downloading image %d: %s\n", i, err)
+			return
+		}
+		defer imgRes.Body.Close()
 
-			imgFileName := filepath.Join(chapterDir, fmt.Sprintf("image_%d.jpg", i))
-			imgFile, err := os.Create(imgFileName)
-			if err != nil {
-				fmt.Printf("error creating image file %d: %s\n", i, err)
-				return
-			}
-			defer imgFile.Close()
+		imgFileName := filepath.Join(chapterDir, fmt.Sprintf("image_%d.jpg", i))
+		imgFile, err := os.Create(imgFileName)
+		if err != nil {
+			fmt.Printf("error creating image file %d: %s\n", i, err)
+			return
+		}
+		defer imgFile.Close()
 
-			_, err = io.Copy(imgFile, imgRes.Body)
-			if err != nil {
-				fmt.Printf("error saving image %d: %s\n", i, err)
-				return
-			}
+		_, err = io.Copy(imgFile, imgRes.Body)
+		if err != nil {
+			fmt.Printf("error saving image %d: %s\n", i, err)
+			return
+		}
 
-			fmt.Printf("Downloaded image %d\n", i)
-		}(i, imgURL)
+		fmt.Printf("Downloaded image %d\n", i)
 	}
 
-	imageWg.Wait()
 	makeCbz(chapterDir)
 	fmt.Println("Chapter download complete")
 }
 
 func (manga *MangaInfo) downloadAllChapters() {
-	start, err := strconv.Atoi(manga.firstChapter)
-	if err != nil {
-		fmt.Println("error converting first chapter to int: ", err)
-		os.Exit(1)
+
+	for _, chapter := range manga.chapterURLs {
+
+		fmt.Printf("Downloading chapter %s\n", chapter.title)
+		downloadChapter(chapter.url)
 	}
 
-	end, err := strconv.Atoi(manga.lastChapter)
-	if err != nil {
-		fmt.Println("error converting last chapter to int: ", err)
-		os.Exit(1)
-	}
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 10) // Limit to 3 concurrent chapter downloads
-
-	for i := start; i <= end; i++ {
-		wg.Add(1)
-		semaphore <- struct{}{}
-		go func(i int) {
-			defer func() { <-semaphore }()
-			fmt.Printf("Downloading chapter %d\n", i)
-			path := strings.ReplaceAll(strings.ToLower(manga.title), " ", "-")
-			url := fmt.Sprintf("https://www.lelmanga.com/%s-%d", path, i)
-			downloadChapter(url, &wg)
-		}(i)
-	}
-
-	wg.Wait()
 }
 
 func main() {
